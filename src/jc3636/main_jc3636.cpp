@@ -747,7 +747,12 @@ static void handleTouch() {
     g_infoDirty = true;  // paintInfoPage will do the full-band clear once
   } else if (e == TOUCH_SWIPE_DOWN && g_view == VIEW_INFO) {
     g_view = VIEW_PET;
-    buddyInvalidate();  // pet redraws fresh on return
+    // Wipe the whole band the Info page drew into — pet canvas is
+    // 220×200 so should in theory fully cover it, but a single belt-
+    // and-braces clear is cheap (~25 ms) and stops stranded pixels
+    // if the row blits ever extend past the pet footprint.
+    display_fill_rect(0, 85, DISPLAY_WIDTH, 205, COL_BG);
+    buddyInvalidate();
   }
 }
 
