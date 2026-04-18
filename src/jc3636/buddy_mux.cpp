@@ -182,10 +182,13 @@ void buddyTick(uint8_t personaState) {
   lastDrawnState = personaState;
   lastDrawnSpecies = currentSpeciesIdx;
 
-  // Clear the full canvas so confetti / heart particles from celebrate
-  // and heart states can reach the wide area without leaving residue.
-  spr.fillRect(0, 0, BUDDY_CANVAS_W,
-               (BUDDY_Y_BASE + 5 * BUDDY_CHAR_H + 12) * _scale, BUDDY_BG);
+  // Clear the full canvas every frame. The tighter "just the sprite
+  // band" clear used in the M5 build leaves pixels below row 164
+  // untouched — which is fine for pure pet-mode, but bites us here
+  // because the permission overlay writes its footer at canvas y≈160
+  // and we'd carry it into the first pet frame as half a line of
+  // orphan text.
+  spr.fill(BUDDY_BG);
 
   const Species* sp = SPECIES_TABLE[currentSpeciesIdx];
   if (sp->states[personaState]) sp->states[personaState](tickCount);
