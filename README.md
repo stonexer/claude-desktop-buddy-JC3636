@@ -1,172 +1,152 @@
-# claude-desktop-buddy
+# claude-desktop-buddy-jc3636
 
-Claude for macOS and Windows can connect Claude Cowork and Claude Code to
-maker devices over BLE, so developers and makers can build hardware that
-displays permission prompts, recent messages, and other interactions. We've
-been impressed by the creativity of the maker community around Claude -
-providing a lightweight, opt-in API is our way of making it easier to build
-fun little hardware devices that integrate with Claude.
+A port of [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy)
+for the **JC3636W518EN** — an ESP32-S3 dev board with a 360×360 round
+ST77916 QSPI LCD and a CST816S touch panel.
 
-> **Building your own device?** You don't need any of the code here. See
-> **[REFERENCE.md](REFERENCE.md)** for the wire protocol: Nordic UART
-> Service UUIDs, JSON schemas, and the folder push transport.
+The original firmware targets the M5StickC Plus (135×240 portrait LCD,
+physical buttons, IMU). This port keeps the same wire protocol
+(Nordic UART Service, line-delimited JSON — see
+[REFERENCE.md](REFERENCE.md)) and the same ASCII pet aesthetic, but
+rewrites the platform layer for the round panel and ESP-IDF 5.x via
+Arduino-ESP32 3.x.
 
-As an example, we built a desk pet on ESP32 that lives off permission
-approvals and interaction with Claude. It sleeps when nothing's happening,
-wakes when sessions start, gets visibly impatient when an approval prompt is
-waiting, and lets you approve or deny right from the device.
-
-<p align="center">
-  <img src="docs/device.jpg" alt="M5StickC Plus running the buddy firmware" width="500">
-</p>
+> **Not affiliated with Anthropic.** This is an independent community
+> port. The BLE bridge it talks to ships with the official Claude
+> macOS/Windows apps behind a developer-mode flag — see the original
+> repo for setup.
 
 ## Hardware
 
-The firmware targets ESP32 with the Arduino framework. As written, it
-depends on the M5StickCPlus library for its display, IMU, and button
-drivers—so you'll need that board, or a fork that swaps those drivers for
-your own pin layout.
+| Spec       | Value                                         |
+| ---------- | --------------------------------------------- |
+| MCU        | ESP32-S3 (16 MB QIO flash, 8 MB OPI PSRAM)    |
+| Display    | ST77916 QSPI, 360×360, 16-bit RGB565          |
+| Touch      | CST816S over I²C *(not wired up yet)*         |
+| Input      | BOOT button (GPIO 0) — demo mode cycling      |
+| BLE        | NimBLE host, Nordic UART Service (NUS)        |
 
-## Flashing
+Pin map is in `src/jc3636/pincfg.h`.
 
-Install
-[PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/),
-then:
+## Features
+
+- Full 7-state ASCII buddy animation ported from the original (blob
+  species — `src/jc3636/buddy_blob.cpp`). Sleep / idle / busy /
+  attention / celebrate / dizzy / heart.
+- Round-panel UI:
+  - Top strip: three pills showing `running / waiting / total`
+    session counters (`R / W / T`).
+  - Center: pet canvas (220×200).
+  - Bottom strip: one-line status message from the heartbeat
+    (`approve: Bash`, `3 sessions`, `waiting for Claude…`).
+  - Transient status dot at 12 o'clock — flashes on link state
+    changes, auto-hides after 10 s so it doesn't clutter the bezel.
+- Permission-prompt takeover screen: when the Desktop asks for
+  permission to run a tool, the pet steps aside and the screen
+  shows the tool name + hint. Approve/deny still happens in the
+  Desktop app.
+- Demo mode: tap BOOT to cycle through all 7 animations without
+  needing a live Claude session. Long-press BOOT (≥1 s) to exit.
+
+## Build
 
 ```bash
-pio run -t upload
+# Once
+pio project init --ide vscode   # optional, for editor support
+
+# Build + flash + monitor
+pio run -e jc3636w518en -t upload
+pio device monitor -e jc3636w518en
 ```
 
-If you're starting from a previously-flashed device, wipe it first:
-
-```bash
-pio run -t erase && pio run -t upload
-```
-
-Once running, you can also wipe everything from the device itself: **hold A
-→ settings → reset → factory reset → tap twice**.
+The board appears as `/dev/cu.usbmodem1101` on macOS (ESP32-S3 built-in
+USB JTAG/Serial). If the first upload hangs mid-flash, hold BOOT while
+re-plugging the USB cable to force ROM download mode, then re-run the
+upload.
 
 ## Pairing
 
-To pair your device with Claude, first enable developer mode (**Help →
-Troubleshooting → Enable Developer Mode**). Then, open the Hardware Buddy
-window in **Developer → Open Hardware Buddy…**, click **Connect**, and pick
-your device from the list. macOS will prompt for Bluetooth permission on
-first connect; grant it.
+Same as the upstream project:
 
-<p align="center">
-  <img src="docs/menu.png" alt="Developer → Open Hardware Buddy… menu item" width="420">
-  <img src="docs/hardware-buddy-window.png" alt="Hardware Buddy window with Connect button and folder drop target" width="420">
-</p>
+1. **Claude for macOS/Windows → Help → Troubleshooting → Enable
+   Developer Mode**.
+2. **Developer → Open Hardware Buddy…** → Connect.
+3. Pick `Claude Buddy JC3636` from the scan list.
 
-Once paired, the bridge auto-reconnects whenever both sides are awake.
+The current build uses **unencrypted** characteristics + JustWorks
+pairing. See *Known limitations* below.
 
-If discovery isn't finding the stick:
+## Triggering pet states
 
-- Make sure it's awake (any button press)
-- Check the stick's settings menu → bluetooth is on
+The pet reacts to heartbeat snapshots the Claude Desktop app pushes
+over BLE:
 
-## Controls
+| State       | Trigger                                  |
+| ----------- | ---------------------------------------- |
+| `idle`      | connected, nothing urgent                |
+| `busy`      | `running >= 3`                           |
+| `attention` | `waiting >= 1` (pending permission)      |
+| `celebrate` | `evt:turn` or `completed: true`          |
+| `sleep`     | reached only via demo mode in this port  |
+| `dizzy`     | demo only (no IMU on this board)         |
+| `heart`     | demo only                                |
 
-|                         | Normal               | Pet         | Info        | Approval    |
-| ----------------------- | -------------------- | ----------- | ----------- | ----------- |
-| **A** (front)           | next screen          | next screen | next screen | **approve** |
-| **B** (right)           | scroll transcript    | next page   | next page   | **deny**    |
-| **Hold A**              | menu                 | menu        | menu        | menu        |
-| **Power** (left, short) | toggle screen off    |             |             |             |
-| **Power** (left, ~6s)   | hard power off       |             |             |             |
-| **Shake**               | dizzy                |             |             | —           |
-| **Face-down**           | nap (energy refills) |             |             |             |
+**Important caveat.** The heartbeat only reflects Claude activity
+running *inside the Desktop app process* (the in-app Claude Code
+panel). Sessions launched from the standalone `claude` CLI in a
+terminal don't show up — see *Known limitations*.
 
-The screen auto-powers-off after 30s of no interaction (kept on while an
-approval prompt is up). Any button press wakes it.
+## Known limitations
 
-## ASCII pets
-
-Eighteen pets, each with seven animations (sleep, idle, busy, attention,
-celebrate, dizzy, heart). Menu → "next pet" cycles them with a counter.
-Choice persists to NVS.
-
-## GIF pets
-
-If you want a custom GIF character instead of an ASCII buddy, drag a
-character pack folder onto the drop target in the Hardware Buddy window. The
-app streams it over BLE and the stick switches to GIF mode live. **Settings
-→ delete char** reverts to ASCII mode.
-
-A character pack is a folder with `manifest.json` and 96px-wide GIFs:
-
-```json
-{
-  "name": "bufo",
-  "colors": {
-    "body": "#6B8E23",
-    "bg": "#000000",
-    "text": "#FFFFFF",
-    "textDim": "#808080",
-    "ink": "#000000"
-  },
-  "states": {
-    "sleep": "sleep.gif",
-    "idle": ["idle_0.gif", "idle_1.gif", "idle_2.gif"],
-    "busy": "busy.gif",
-    "attention": "attention.gif",
-    "celebrate": "celebrate.gif",
-    "dizzy": "dizzy.gif",
-    "heart": "heart.gif"
-  }
-}
-```
-
-State values can be a single filename or an array. Arrays rotate: each
-loop-end advances to the next GIF, useful for an idle activity carousel so
-the home screen doesn't loop one clip forever.
-
-GIFs are 96px wide; height up to ~140px stays on a 135×240 portrait screen.
-Crop tight to the character — transparent margins waste screen and shrink
-the sprite. `tools/prep_character.py` handles the resize: feed it source
-GIFs at any sizes and it produces a 96px-wide set where the character is the
-same scale in every state.
-
-The whole folder must fit under 1.8MB —
-`gifsicle --lossy=80 -O3 --colors 64` typically cuts 40–60%.
-
-See `characters/bufo/` for a working example.
-
-If you're iterating on a character and would rather skip the BLE round-trip,
-`tools/flash_character.py characters/bufo` stages it into `data/` and runs
-`pio run -t uploadfs` directly over USB.
-
-## The seven states
-
-| State       | Trigger                     | Feel                        |
-| ----------- | --------------------------- | --------------------------- |
-| `sleep`     | bridge not connected        | eyes closed, slow breathing |
-| `idle`      | connected, nothing urgent   | blinking, looking around    |
-| `busy`      | sessions actively running   | sweating, working           |
-| `attention` | approval pending            | alert, **LED blinks**       |
-| `celebrate` | level up (every 50K tokens) | confetti, bouncing          |
-| `dizzy`     | you shook the stick         | spiral eyes, wobbling       |
-| `heart`     | approved in under 5s        | floating hearts             |
+- **CLI sessions don't feed the heartbeat.** There's no documented
+  IPC between the `claude` terminal CLI and the Desktop app's
+  Hardware Buddy bridge. If you want the pet to react to CLI work,
+  you'd need a separate bridge process (e.g. a Node/Python helper
+  that reads `claude --output-format stream-json` and writes NUS
+  frames to the device directly). Open to PRs.
+- **BLE encryption.** The original M5 firmware runs LE Secure
+  Connections with a 6-digit passkey (MITM-protected). Under
+  pioarduino's NimBLE stack, JustWorks pairing was the only mode
+  that kept the TX CCCD subscribe from silently failing, so this
+  port drops MITM for now. Transcript snippets over the link are
+  sniffable. Don't pair near an adversarial radio.
+- **Touch is not wired up.** CST816S pins are declared in
+  `pincfg.h` but no driver is bound yet. BOOT button is the only
+  input.
+- **No IMU / RTC / battery.** The JC3636 board has none of these.
+  Status ack reports `bat.pct:100, mA:0, usb:true` as placeholder
+  values; shake / face-down / clock features from the M5 version
+  are not ported.
 
 ## Project layout
 
 ```
 src/
-  main.cpp       — loop, state machine, UI screens
-  buddy.cpp      — ASCII species dispatch + render helpers
-  buddies/       — one file per species, seven anim functions each
-  ble_bridge.cpp — Nordic UART service, line-buffered TX/RX
-  character.cpp  — GIF decode + render
-  data.h         — wire protocol, JSON parse
-  xfer.h         — folder push receiver
-  stats.h        — NVS-backed stats, settings, owner, species choice
-characters/      — example GIF character packs
-tools/           — generators and converters
+  ble_bridge.h                          ← shared public header
+  ble_bridge.cpp                        ← Bluedroid version (M5 env, unused here)
+  jc3636/
+    main_jc3636.cpp                     ← setup/loop, UI composition
+    display.c / display.h               ← ST77916 QSPI panel + LEDC backlight
+    canvas.h / canvas.cpp               ← TFT_eSPI-shaped RGB565 sprite + 6×8 font
+    font6x8.h                           ← Adafruit_GFX glcdfont (Apache-2.0)
+    buddy_blob.h / buddy_blob.cpp       ← blob species, 7 state functions
+    ble_bridge_nimble.cpp               ← NimBLE NUS server, JustWorks pairing
+    pincfg.h                            ← board pin map
+    vendor/                             ← esp_lcd_st77916 driver (Apache-2.0)
+boards/
+  jc3636w518en.json                     ← PlatformIO board definition
+platformio.ini                          ← [env:jc3636w518en] + upstream [env:m5stickc-plus]
+REFERENCE.md                            ← unchanged BLE protocol spec from upstream
 ```
 
-## Availability
+## Credits & license
 
-The BLE API is only available when the desktop apps are in developer mode
-(**Help → Troubleshooting → Enable Developer Mode**). It's intended for
-makers and developers and isn't an officially supported product feature.
+- Upstream firmware, BLE protocol, and original pet art:
+  [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy)
+  (© 2026 Anthropic, PBC — MIT).
+- Bitmap font: Adafruit GFX Library `glcdfont.c` (Apache-2.0).
+- ST77916 panel driver: Espressif `esp_lcd_st77916` component
+  (Apache-2.0) — vendored under `src/jc3636/vendor/`.
+
+This port is released under the same **MIT License** as the upstream
+project. See [LICENSE](LICENSE).

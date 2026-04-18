@@ -30,3 +30,8 @@ void bleClearBonds();
 size_t bleAvailable();
 int bleRead();
 size_t bleWrite(const uint8_t* data, size_t len);
+// True after the client has written non-zero to the TX CCCD, i.e.
+// actually subscribed to receive notifications. Under the NimBLE
+// host stack, notify() is a silent no-op until this flips true, so
+// on-device UIs can show whether the peer is really listening.
+bool bleTxSubscribed();

@@ -1,31 +1,36 @@
 # Contributing
 
-The best contribution is a fork.
+PRs welcome. This is a community port, not an official Anthropic project
+— the upstream [claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy)
+explicitly asks you to fork rather than PR, but the JC3636 port here
+*does* take contributions.
 
-This repo is a reference implementation — a worked example of one device
-that speaks the BLE protocol described in [REFERENCE.md](REFERENCE.md).
-It's not an actively maintained project, and we'd rather you build the
-thing _you_ want than bend this one into it.
+## Good first PRs
 
-## So what should I do instead?
+- Wire up the CST816S touch driver so tap/swipe can drive UI actions.
+- Port more species from `upstream/src/buddies/` into the
+  Canvas-shaped renderer.
+- Add a CLI-side bridge so `claude` terminal sessions can drive the
+  pet without the Desktop app being in the loop.
+- Shrink the flash footprint (currently ~700 KB of a 2 MB app partition).
 
-**Fork it and make it yours.** Swap the M5Stick for a Pi Pico W. Replace
-the ASCII pets with an e-ink panel. Put it in a 3D-printed shell. Rip
-out everything but `ble_bridge.cpp` and the JSON parser. The protocol is
-the stable surface — `REFERENCE.md` is the contract, this firmware is
-just one way to honor it.
+## Keeping in sync with upstream
 
-## What we will take
+The BLE wire protocol lives in [REFERENCE.md](REFERENCE.md) and should
+stay verbatim with upstream. If upstream publishes a protocol bump,
+copy the updated file over instead of editing in place — anything
+that drifts off-spec stops working with the Desktop bridge.
 
-- Corrections to `REFERENCE.md` if the protocol docs are wrong or
-  unclear
-- Fixes for bugs that make the reference _not work as a reference_ —
-  i.e., it doesn't pair, doesn't render, crashes on boot
+Platform-specific code lives under `src/jc3636/`. The M5 env in
+`platformio.ini` is kept for reference but is not expected to build
+on current pioarduino (its upstream Arduino-ESP32 no longer ships the
+`m5stick-c` variant).
 
-## What we won't take
+## Local dev
 
-- New features, new pets, new screens
-- Ports to other boards (fork!)
-- Refactors, style changes, dependency bumps
+```bash
+pio run -e jc3636w518en -t upload
+```
 
-If you're unsure which bucket something falls in, it's likely the second one.
+If the device gets stuck mid-upload, hold BOOT while re-plugging USB
+to force ROM download mode.
