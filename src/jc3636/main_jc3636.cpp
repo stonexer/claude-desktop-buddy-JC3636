@@ -123,6 +123,10 @@ enum ViewMode : uint8_t {
   VIEW_INFO,
 };
 static ViewMode g_view = VIEW_PET;
+// Set true whenever we switch INTO the Info view — paintInfoPage reads
+// and clears it so we only do the full-band black fill once per
+// visit, instead of every 200 ms tick.
+static bool g_infoDirty = true;
 
 static TamaState tama;
 static PersonaState activeState = P_IDLE;
@@ -452,6 +456,12 @@ static void paintMsg() {
 // pixel height of this slot on screen — the text is vertically
 // centered within it; the full LINE_W × rowH area is wiped first so
 // nothing ghosts between frames.
+//
+// Important: display_draw_rect is async (DMA-queued). Because every row
+// reuses the same lineCanvas buffer, the next fill() would race with
+// the in-flight transfer and corrupt the previous row on screen. A
+// small delay after each blit gives the DMA time to drain; 300×40
+// bytes at 40 MHz QSPI ≈ 5 ms, so 6 ms is a safe floor.
 static void drawInfoRow(int y, int rowH, const char* text, uint16_t fg, uint8_t scale) {
   lineCanvas->fill(COL_BG);
   const int len = (int)strlen(text);
@@ -463,6 +473,7 @@ static void drawInfoRow(int y, int rowH, const char* text, uint16_t fg, uint8_t 
   lineCanvas->setCursor(x < 0 ? 0 : x, ty < 0 ? 0 : ty);
   lineCanvas->print(text);
   display_draw_rect(LINE_X, y, LINE_W, rowH, lineCanvas->pixels());
+  delay(6);
 }
 
 // Info view — dashboard that fills the 360×360 panel between the top
@@ -479,10 +490,13 @@ static void drawInfoRow(int y, int rowH, const char* text, uint16_t fg, uint8_t 
 //   255 species N   (scale 2, 16)
 //   280 up … heap … (scale 1, 8)
 static void paintInfoPage() {
-  // First, wipe the pet area so no animation residue sits under the
-  // text (the pet canvas is 220×200 centered, but we're painting in a
-  // 300-wide band — clear a rect that fully covers it).
-  display_fill_rect(LINE_X, 85, LINE_W, 205, COL_BG);
+  // Full-band clear only on the first frame after entering Info;
+  // subsequent ticks just repaint rows in place (blits are
+  // position-stable and overwrite last frame's pixels, so no flash).
+  if (g_infoDirty) {
+    display_fill_rect(LINE_X, 85, LINE_W, 205, COL_BG);
+    g_infoDirty = false;
+  }
 
   drawInfoRow(100, 12, "INFO", COL_WHITE, 1);
 
@@ -729,10 +743,10 @@ static void handleTouch() {
   // (pills, msg) stay regardless of view so BLE state is still visible.
   if (e == TOUCH_SWIPE_UP && g_view == VIEW_PET) {
     g_view = VIEW_INFO;
-    buddyInvalidate();  // force pet redraw on return
+    g_infoDirty = true;  // paintInfoPage will do the full-band clear once
   } else if (e == TOUCH_SWIPE_DOWN && g_view == VIEW_INFO) {
     g_view = VIEW_PET;
-    buddyInvalidate();
+    buddyInvalidate();  // pet redraws fresh on return
   }
 }
 
