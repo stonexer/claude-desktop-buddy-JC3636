@@ -12,16 +12,28 @@ struct TouchTap {
   int16_t y;
 };
 
-// Initialize Wire on the touch bus and reset the CST816S. Returns false
-// if the I2C bus can't come up — caller should surface the failure
-// (screen prompt etc.) rather than block.
+enum TouchEvent {
+  TOUCH_NONE = 0,
+  TOUCH_TAP,          // quick press + release, no swipe
+  TOUCH_SWIPE_LEFT,
+  TOUCH_SWIPE_RIGHT,
+  TOUCH_SWIPE_UP,
+  TOUCH_SWIPE_DOWN,
+};
+
+// Initialize Wire on the touch bus and reset the CST816S.
 bool touch_init(void);
 
-// Edge-triggered single-tap. Returns true exactly on the frame the
-// finger first presses down (press-edge), writing the position to *out.
-// While the finger is held or released, returns false. Safe to call
-// every loop iteration.
+// DEPRECATED: press-edge tap only. Kept for back-compat — prefer
+// touch_poll_event(), which distinguishes taps from swipes.
 bool touch_poll_tap(struct TouchTap* out);
+
+// Release-edge event classifier. Returns true exactly on the frame the
+// finger lifts, reporting the gesture kind in *evt and the lift
+// position in *pos. Uses the CST816S gesture register when populated
+// (vendor firmware fills it on swipe) and falls back to a simple
+// start→end vector threshold otherwise.
+bool touch_poll_event(enum TouchEvent* evt, struct TouchTap* pos);
 
 #ifdef __cplusplus
 }

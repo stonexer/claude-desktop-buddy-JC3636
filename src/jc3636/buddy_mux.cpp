@@ -13,6 +13,7 @@
 #include "../buddy.h"
 #include "../buddy_common.h"
 #include "canvas.h"
+#include <Arduino.h>  // for millis()
 #include <string.h>
 
 extern Canvas spr;

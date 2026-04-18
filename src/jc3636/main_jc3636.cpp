@@ -21,9 +21,10 @@
 
 #include "display.h"
 #include "canvas.h"
-#include "buddy_blob.h"
+#include "../buddy.h"
 #include "ble_bridge.h"
 #include "touch.h"
+#include "compat/stats.h"
 
 // ───────────────────────── Layout ─────────────────────────────────
 
@@ -35,13 +36,16 @@ static constexpr int CANVAS_H = 200;
 static constexpr int CANVAS_X = (DISPLAY_WIDTH  - CANVAS_W) / 2;
 static constexpr int CANVAS_Y = (DISPLAY_HEIGHT - CANVAS_H) / 2;
 
-// Top pills: three 70×24 color chips with running/waiting/total.
-// 240 total width (3×70 + 2×15 gap) centered at x=60..300. y=30
-// keeps the corners of the strip at radius < 175 from center.
-static constexpr int TOP_W = 240;
+// Top pills: three 66×24 color chips with running/waiting/total.
+// Geometry is chosen so the pill corners stay inside the 180 px
+// inscribed circle: at y=55, x=70..290, the worst-case corner is
+// (70,55), which sits ~166 px from screen center. The label for
+// each pill gets the full chip, so trimming width to 66 keeps it
+// legible.
+static constexpr int TOP_W = 220;
 static constexpr int TOP_H = 28;
 static constexpr int TOP_X = (DISPLAY_WIDTH - TOP_W) / 2;
-static constexpr int TOP_Y = 30;
+static constexpr int TOP_Y = 55;
 
 // Bottom msg strip: 280 wide is near the widest safe chord at
 // y=290..314 (distance to center ≈ 137, still < 180).
@@ -93,6 +97,32 @@ struct TamaState {
   // Bumps when the prompt identity changes so the UI knows to redraw.
   uint16_t promptGen = 0;
 };
+
+// Owner name loaded from NVS at boot + overwritten when the desktop
+// sends {"cmd":"owner","name":"..."}. Empty until we hear from the
+// desktop for the first time. msg strip uses it as a "Hi, Name" in
+// idle so the device feels personal.
+static char g_owner[32] = {0};
+
+// Level progression — persisted. g_level bumps one per 50 000 tokens
+// of output (whatever the desktop reports in `tokens_today`). The
+// delta calculation lives in applyJson; the progress bar on the Info
+// page reads g_tokensIntoLevel to show how close we are to levelling
+// up. On boot the level is restored from NVS; progress-within-level
+// is not persisted (deliberate — fresh boots start "empty" toward
+// the next level, keeping expectations honest).
+static constexpr uint32_t TOKENS_PER_LEVEL = 50000;
+static uint8_t  g_level             = 0;
+static uint32_t g_tokensIntoLevel   = 0;
+static uint32_t g_lastTokensToday   = 0;  // for delta computation
+
+// View mode — swipe up switches to the Info page; swipe down returns
+// to the pet. The permission overlay still preempts both views.
+enum ViewMode : uint8_t {
+  VIEW_PET = 0,
+  VIEW_INFO,
+};
+static ViewMode g_view = VIEW_PET;
 
 static TamaState tama;
 static PersonaState activeState = P_IDLE;
@@ -181,7 +211,14 @@ static void applyJson(const char* line) {
   if (cmd) {
     if      (strcmp(cmd, "status") == 0) { ackStatus(); }
     else if (strcmp(cmd, "name")   == 0) { ackCmd("name",   true); }
-    else if (strcmp(cmd, "owner")  == 0) { ackCmd("owner",  true); }
+    else if (strcmp(cmd, "owner")  == 0) {
+      const char* nm = doc["name"] | (const char*)nullptr;
+      if (nm && nm[0]) {
+        copyField(g_owner, sizeof(g_owner), nm);
+        ownerSave(g_owner);
+      }
+      ackCmd("owner", true);
+    }
     else if (strcmp(cmd, "unpair") == 0) { bleClearBonds(); ackCmd("unpair", true); }
     else                                 { ackCmd(cmd,      false); }
     return;
@@ -202,7 +239,29 @@ static void applyJson(const char* line) {
   if (!wasCompleted && tama.recentlyCompleted) {
     triggerOneShot(P_CELEBRATE, 3500);
   }
-  tama.tokensToday = doc["tokens_today"] | tama.tokensToday;
+  // Compute a positive delta against the last snapshot. tokens_today
+  // resets at local midnight on the desktop, so a drop means "new
+  // day" — treat the new value as pure delta instead of going
+  // negative.
+  uint32_t newTokens = doc["tokens_today"] | tama.tokensToday;
+  uint32_t delta = (newTokens >= g_lastTokensToday)
+                      ? (newTokens - g_lastTokensToday)
+                      : newTokens;
+  g_lastTokensToday = newTokens;
+  tama.tokensToday  = newTokens;
+
+  // Roll over tokens into levels. A single heartbeat can in principle
+  // carry a huge jump (e.g. first hb after a long offline period) so
+  // the while-loop handles multi-level increments.
+  if (delta > 0) {
+    g_tokensIntoLevel += delta;
+    while (g_tokensIntoLevel >= TOKENS_PER_LEVEL) {
+      g_tokensIntoLevel -= TOKENS_PER_LEVEL;
+      if (g_level < 255) g_level++;
+      levelSave(g_level);
+      triggerOneShot(P_CELEBRATE, 5000);  // longer than turn-end so it reads as "level up"
+    }
+  }
   const char* m = doc["msg"] | (const char*)nullptr;
   if (m) copyField(tama.msg, sizeof(tama.msg), m);
 
@@ -247,9 +306,21 @@ static void drainBLE() {
 
 // ───────────────────────── Render ─────────────────────────────────
 
-static Canvas* petCanvas = nullptr;
-static Canvas* topCanvas = nullptr;
-static Canvas* msgCanvas = nullptr;
+// `spr` is the pet canvas — exposed as a global so buddy_mux.cpp can
+// pick it up via `extern Canvas spr`. The M5 port had the same pattern
+// (global TFT_eSprite spr). petCanvas is a convenience alias.
+Canvas spr(CANVAS_W, CANVAS_H);
+static Canvas* petCanvas  = &spr;
+static Canvas* topCanvas  = nullptr;
+static Canvas* msgCanvas  = nullptr;
+// One-line scratch canvas used by the Info view. Wide enough for
+// 300 px text blocks and tall enough (40) to hold a scale-4 glyph
+// (32 px). Reused for every row so the Info layout can mix font
+// sizes without allocating per-draw.
+static Canvas* lineCanvas = nullptr;
+static constexpr int LINE_W = 300;
+static constexpr int LINE_H = 40;
+static constexpr int LINE_X = (DISPLAY_WIDTH - LINE_W) / 2;
 static uint32_t tickCount = 0;
 static uint32_t nextTickAtMs = 0;
 static constexpr uint32_t TICK_MS = 200;
@@ -317,8 +388,8 @@ static void paintTop() {
 
   topCanvas->fill(COL_BG);
 
-  // Three 70×24 pills, 15 px gap, total 240.
-  const int pw = 70, ph = 24, gap = 15;
+  // Three 66×24 pills, 11 px gap, total 220 — matches TOP_W.
+  const int pw = 66, ph = 24, gap = 11;
   const int y0 = (TOP_H - ph) / 2;
 
   char buf[12];
@@ -349,6 +420,8 @@ static void paintMsg() {
   } else if (tama.sessionsRunning > 0 || tama.sessionsWaiting > 0 || tama.sessionsTotal > 0) {
     snprintf(target, sizeof(target), "%u session%s",
              (unsigned)tama.sessionsTotal, tama.sessionsTotal == 1 ? "" : "s");
+  } else if (g_owner[0]) {
+    snprintf(target, sizeof(target), "hi, %s", g_owner);
   } else {
     strncpy(target, "idle", sizeof(target)); target[sizeof(target)-1]=0;
   }
@@ -357,8 +430,11 @@ static void paintMsg() {
   strncpy(lastMsg, target, sizeof(lastMsg)); lastMsg[sizeof(lastMsg)-1]=0;
 
   msgCanvas->fill(COL_BG);
-  // Size-1 text (6×8) — truncate to fit the 280 px strip: 46 chars max.
-  const int maxChars = MSG_W / 6;
+  // Scale 1 (6×8) keeps the strip quiet — the whole point of the
+  // bottom row is to be glanceable, not shouty. 46 chars fit at
+  // 280 px wide, plenty for "approve: Bash" / "N sessions" / etc.
+  const int scale    = 1;
+  const int maxChars = MSG_W / (6 * scale);
   char trimmed[64];
   int srcLen = (int)strlen(target);
   int keep = srcLen < maxChars ? srcLen : maxChars;
@@ -366,13 +442,89 @@ static void paintMsg() {
   trimmed[keep] = 0;
 
   uint16_t color = (!bleConnected() || !dataLive()) ? COL_DIM : COL_WHITE;
-  drawCentered(msgCanvas, MSG_W, (MSG_H - 8) / 2, trimmed, color, COL_BG, 1);
+  drawCentered(msgCanvas, MSG_W, (MSG_H - 8 * scale) / 2, trimmed, color, COL_BG, scale);
 
   display_draw_rect(MSG_X, MSG_Y, MSG_W, MSG_H, msgCanvas->pixels());
 }
 
+// Paint one text row onto the shared lineCanvas and blit it to (LINE_X,
+// y). Caller supplies scale so headings/body mix cleanly. `rowH` is the
+// pixel height of this slot on screen — the text is vertically
+// centered within it; the full LINE_W × rowH area is wiped first so
+// nothing ghosts between frames.
+static void drawInfoRow(int y, int rowH, const char* text, uint16_t fg, uint8_t scale) {
+  lineCanvas->fill(COL_BG);
+  const int len = (int)strlen(text);
+  const int w   = len * 6 * scale;
+  const int x   = (LINE_W - w) / 2;
+  const int ty  = (rowH - 8 * scale) / 2;
+  lineCanvas->setTextSize(scale);
+  lineCanvas->setTextColor(fg, COL_BG);
+  lineCanvas->setCursor(x < 0 ? 0 : x, ty < 0 ? 0 : ty);
+  lineCanvas->print(text);
+  display_draw_rect(LINE_X, y, LINE_W, rowH, lineCanvas->pixels());
+}
+
+// Info view — dashboard that fills the 360×360 panel between the top
+// pills (ends at y=83) and the bottom msg strip (starts at y=290).
+// Font sizes escalate for emphasis: LVL is scale-4 (24×32 glyphs) so
+// it reads across the room; service/system rows are scale-1.
+//
+// Layout (y coords are on the physical panel, not canvas-local):
+//   95  INFO        (scale 3, white, 24 px tall)
+//   130 hi, <owner> (scale 2, 16)
+//   170 LVL N       (scale 4, cyan, 32)
+//   212 ──progress──(4 px bar)
+//   230 tokens N    (scale 2, 16)
+//   255 species N   (scale 2, 16)
+//   280 up … heap … (scale 1, 8)
+static void paintInfoPage() {
+  // First, wipe the pet area so no animation residue sits under the
+  // text (the pet canvas is 220×200 centered, but we're painting in a
+  // 300-wide band — clear a rect that fully covers it).
+  display_fill_rect(LINE_X, 85, LINE_W, 205, COL_BG);
+
+  drawInfoRow(100, 12, "INFO", COL_WHITE, 1);
+
+  char buf[48];
+  if (g_owner[0]) snprintf(buf, sizeof(buf), "hi, %s", g_owner);
+  else            snprintf(buf, sizeof(buf), "(no owner set)");
+  drawInfoRow(120, 12, buf, g_owner[0] ? COL_WHITE : COL_DIM, 1);
+
+  snprintf(buf, sizeof(buf), "LVL %u", (unsigned)g_level);
+  drawInfoRow(150, 20, buf, COL_RUN, 2);
+
+  // Progress bar, drawn directly onto the panel.
+  const int barW = 200;
+  const int barX = (DISPLAY_WIDTH - barW) / 2;
+  const int barY = 180;
+  const int barH = 3;
+  int progressPx = (int)((uint64_t)barW * g_tokensIntoLevel / TOKENS_PER_LEVEL);
+  if (progressPx > barW) progressPx = barW;
+  display_fill_rect(barX, barY, barW, barH, COL_DIM);
+  if (progressPx > 0) display_fill_rect(barX, barY, progressPx, barH, COL_RUN);
+
+  snprintf(buf, sizeof(buf), "tokens %lu", (unsigned long)tama.tokensToday);
+  drawInfoRow(195, 12, buf, COL_WHITE, 1);
+
+  snprintf(buf, sizeof(buf), "species %s", buddySpeciesName());
+  drawInfoRow(215, 12, buf, COL_WHITE, 1);
+
+  uint32_t up = millis() / 1000;
+  uint32_t H  = up / 3600;
+  uint32_t M  = (up / 60) % 60;
+  uint32_t S  = up % 60;
+  snprintf(buf, sizeof(buf),
+           "up %02lu:%02lu:%02lu  heap %luk",
+           (unsigned long)H, (unsigned long)M, (unsigned long)S,
+           (unsigned long)(ESP.getFreeHeap() / 1024));
+  drawInfoRow(240, 12, buf, COL_DIM, 1);
+}
+
 static void paintPetFrame(PersonaState st) {
-  blobRender(*petCanvas, tickCount, (uint8_t)st);
+  // buddyTick handles its own per-frame gating + canvas clear; it
+  // writes straight into the global `spr` (== *petCanvas).
+  buddyTick((uint8_t)st);
   display_draw_rect(CANVAS_X, CANVAS_Y, CANVAS_W, CANVAS_H, petCanvas->pixels());
 }
 
@@ -457,6 +609,13 @@ static void paintStatusDot() {
 
 // ───────────────────────── Button ─────────────────────────────────
 
+static void cycleSpecies(int delta);  // defined below, used by pollButton
+
+// BOOT (GPIO0) semantics:
+//   short press  → cycle pet species (persisted to NVS); in demo mode
+//                  it cycles the demo state instead so the 7 animations
+//                  are still reachable.
+//   long press   → toggle demo mode on/off.
 static void pollButton() {
   static uint32_t pressStart = 0;
   static bool     wasDown    = false;
@@ -475,10 +634,12 @@ static void pollButton() {
     wasDown = false;
     lastEdgeMs = now;
     if (held >= 1000) {
-      demoMode = false;
-    } else {
-      demoMode = true;
+      demoMode = !demoMode;
+      demoStateIdx = 0;
+    } else if (demoMode) {
       demoStateIdx = (demoStateIdx + 1) % 7;
+    } else {
+      cycleSpecies(+1);
     }
   }
 }
@@ -505,34 +666,73 @@ void setup() {
     // decide permissions from the hardware.
   }
 
-  petCanvas = new Canvas(CANVAS_W, CANVAS_H);
-  topCanvas = new Canvas(TOP_W,    TOP_H);
-  msgCanvas = new Canvas(MSG_W,    MSG_H);
-  blobInit(*petCanvas);
+  // petCanvas already points at the global `spr`. Remaining canvases
+  // are heap-allocated — the pet canvas is the largest (220×200), the
+  // other two are small strips we can afford in internal SRAM.
+  topCanvas  = new Canvas(TOP_W,  TOP_H);
+  msgCanvas  = new Canvas(MSG_W,  MSG_H);
+  lineCanvas = new Canvas(LINE_W, LINE_H);
+  buddyInit();
+  ownerLoad(g_owner, sizeof(g_owner));
+  g_level = levelLoad();
 
   bleInit("Claude Buddy JC3636");
 
   nextTickAtMs = millis();
 }
 
-// Handle a single-tap edge from the CST816S. During a pending permission
-// prompt the tap position decides approve vs deny; otherwise we ignore
-// it (future: demo-mode toggle, state shortcuts).
-static void handleTouch() {
-  TouchTap t;
-  if (!touch_poll_tap(&t)) return;
+// Wrap the species index in either direction, persist to NVS, and
+// trigger a redraw. Shared by BOOT short-press and the left/right
+// swipe handlers so they stay in lockstep.
+static void cycleSpecies(int delta) {
+  uint8_t n = buddySpeciesCount();
+  if (n == 0) return;
+  int cur = (int)buddySpeciesIdx();
+  int next = ((cur + delta) % (int)n + (int)n) % (int)n;
+  buddySetSpeciesIdx((uint8_t)next);
+  speciesIdxSave((uint8_t)next);
+  buddyInvalidate();
+}
 
-  if (tama.promptId[0] != 0) {
-    const char* decision = (t.x >= DISPLAY_WIDTH / 2) ? "once" : "deny";
+// Consume whatever touch gesture just fired. Priority order:
+//   1. Pending permission prompt + tap → approve (right half) / deny.
+//   2. Left/right swipe → cycle species (in demo mode we cycle the
+//      demo state instead, so all 7 animations stay reachable).
+//   3. Everything else (up/down swipe, stray tap without a prompt)
+//      is swallowed for now; future: double-tap → celebrate, etc.
+static void handleTouch() {
+  TouchEvent e;
+  TouchTap   pos;
+  if (!touch_poll_event(&e, &pos)) return;
+
+  if (e == TOUCH_TAP && tama.promptId[0] != 0) {
+    const char* decision = (pos.x >= DISPLAY_WIDTH / 2) ? "once" : "deny";
     sendPermission(tama.promptId, decision);
-    // Clear locally so we don't double-fire if the desktop's next
-    // heartbeat still carries the same prompt. The real server-side
-    // clear happens when the desktop processes the decision and sends
-    // the next hb without the `prompt` field.
     tama.promptId[0]   = 0;
     tama.promptTool[0] = 0;
     tama.promptHint[0] = 0;
     tama.promptGen++;
+    return;
+  }
+
+  if (e == TOUCH_SWIPE_LEFT || e == TOUCH_SWIPE_RIGHT) {
+    const int delta = (e == TOUCH_SWIPE_RIGHT) ? +1 : -1;
+    if (demoMode) {
+      demoStateIdx = (uint8_t)((demoStateIdx + 7 + delta) % 7);
+    } else {
+      cycleSpecies(delta);
+    }
+    return;
+  }
+
+  // Up/down swipes page between pet and info. The top/bottom strips
+  // (pills, msg) stay regardless of view so BLE state is still visible.
+  if (e == TOUCH_SWIPE_UP && g_view == VIEW_PET) {
+    g_view = VIEW_INFO;
+    buddyInvalidate();  // force pet redraw on return
+  } else if (e == TOUCH_SWIPE_DOWN && g_view == VIEW_INFO) {
+    g_view = VIEW_PET;
+    buddyInvalidate();
   }
 }
 
@@ -556,6 +756,8 @@ void loop() {
         paintPromptOverlay();
         lastPromptGen = tama.promptGen;
       }
+    } else if (g_view == VIEW_INFO) {
+      paintInfoPage();
     } else {
       PersonaState desired;
       if (demoMode) {
