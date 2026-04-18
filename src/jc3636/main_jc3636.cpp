@@ -317,12 +317,13 @@ Canvas spr(CANVAS_W, CANVAS_H);
 static Canvas* petCanvas  = &spr;
 static Canvas* topCanvas  = nullptr;
 static Canvas* msgCanvas  = nullptr;
-// One-line scratch canvas used by the Info view. Wide enough for
-// 300 px text blocks and tall enough (40) to hold a scale-4 glyph
-// (32 px). Reused for every row so the Info layout can mix font
-// sizes without allocating per-draw.
+// One-line scratch canvas used by the Info view. Width matches the
+// pet canvas (220) so switching back from Info to Pet fully covers
+// the old text — anything outside that band would strand pixels the
+// pet redraw can't reach. 40 px tall is enough for a scale-3 glyph
+// (24 px) plus breathing room.
 static Canvas* lineCanvas = nullptr;
-static constexpr int LINE_W = 300;
+static constexpr int LINE_W = 220;
 static constexpr int LINE_H = 40;
 static constexpr int LINE_X = (DISPLAY_WIDTH - LINE_W) / 2;
 static uint32_t tickCount = 0;
