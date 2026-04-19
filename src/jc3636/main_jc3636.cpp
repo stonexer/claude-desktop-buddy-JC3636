@@ -453,16 +453,9 @@ static void paintMsg() {
 }
 
 // Paint one text row onto the shared lineCanvas and blit it to (LINE_X,
-// y). Caller supplies scale so headings/body mix cleanly. `rowH` is the
-// pixel height of this slot on screen — the text is vertically
-// centered within it; the full LINE_W × rowH area is wiped first so
-// nothing ghosts between frames.
-//
-// Important: display_draw_rect is async (DMA-queued). Because every row
-// reuses the same lineCanvas buffer, the next fill() would race with
-// the in-flight transfer and corrupt the previous row on screen. A
-// small delay after each blit gives the DMA time to drain; 300×40
-// bytes at 40 MHz QSPI ≈ 5 ms, so 6 ms is a safe floor.
+// y). The LCD IO queue is configured with depth 1 (see display.c), so
+// display_draw_rect blocks until the transfer completes — caller can
+// reuse the lineCanvas buffer on the very next call with no race.
 static void drawInfoRow(int y, int rowH, const char* text, uint16_t fg, uint8_t scale) {
   lineCanvas->fill(COL_BG);
   const int len = (int)strlen(text);
@@ -474,7 +467,6 @@ static void drawInfoRow(int y, int rowH, const char* text, uint16_t fg, uint8_t 
   lineCanvas->setCursor(x < 0 ? 0 : x, ty < 0 ? 0 : ty);
   lineCanvas->print(text);
   display_draw_rect(LINE_X, y, LINE_W, rowH, lineCanvas->pixels());
-  delay(6);
 }
 
 // Info view — dashboard that fills the 360×360 panel between the top

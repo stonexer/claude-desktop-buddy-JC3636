@@ -251,8 +251,15 @@ static esp_err_t lcd_init(void)
     if (err != ESP_OK) return err;
 
     ESP_LOGI(TAG, "Panel IO");
-    const esp_lcd_panel_io_spi_config_t io_cfg =
+    esp_lcd_panel_io_spi_config_t io_cfg =
         ST77916_PANEL_IO_QSPI_CONFIG(TFT_CS, NULL, NULL);
+    // Depth 1 turns draw_bitmap into a synchronous blit: the next call
+    // blocks until the previous transfer has cleared. That means the
+    // caller can reuse the same source buffer immediately — which is
+    // exactly what the Info-page row canvas does, and why a depth-10
+    // queue was silently corrupting previous rows. With depth=1 we
+    // can drop the manual ~6 ms delay between row blits.
+    io_cfg.trans_queue_depth = 1;
     err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &lcd_io);
     if (err != ESP_OK) return err;
 
