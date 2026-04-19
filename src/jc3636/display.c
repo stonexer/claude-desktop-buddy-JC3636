@@ -10,6 +10,7 @@
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
+#include "freertos/semphr.h"
 #include "vendor/esp_lcd_st77916.h"
 
 static const char *TAG = "display";
@@ -26,6 +27,21 @@ static const char *TAG = "display";
 static esp_lcd_panel_handle_t    lcd_panel = NULL;
 static esp_lcd_panel_io_handle_t lcd_io    = NULL;
 static uint16_t                 *strip_buf = NULL;  // DMA-capable scratch
+static SemaphoreHandle_t         trans_done_sem = NULL;
+
+// Fires from the panel-IO ISR each time a color transfer finishes.
+// Gives the trans_done_sem so display_draw_rect can block until the
+// caller's source buffer is truly free to reuse (the "async DMA keeps
+// reading after draw_bitmap returned" race is the whole reason
+// Info-page row blits were getting corrupted).
+static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t io,
+                                          esp_lcd_panel_io_event_data_t *data,
+                                          void *user_ctx) {
+  (void)io; (void)data; (void)user_ctx;
+  BaseType_t woken = pdFALSE;
+  xSemaphoreGiveFromISR(trans_done_sem, &woken);
+  return woken == pdTRUE;
+}
 
 // Vendor init sequence lifted verbatim from the JC3636W518EN reference
 // firmware's display.c — it's tuned for this specific panel lot and
@@ -252,13 +268,11 @@ static esp_err_t lcd_init(void)
 
     ESP_LOGI(TAG, "Panel IO");
     esp_lcd_panel_io_spi_config_t io_cfg =
-        ST77916_PANEL_IO_QSPI_CONFIG(TFT_CS, NULL, NULL);
-    // Depth 1 turns draw_bitmap into a synchronous blit: the next call
-    // blocks until the previous transfer has cleared. That means the
-    // caller can reuse the same source buffer immediately — which is
-    // exactly what the Info-page row canvas does, and why a depth-10
-    // queue was silently corrupting previous rows. With depth=1 we
-    // can drop the manual ~6 ms delay between row blits.
+        ST77916_PANEL_IO_QSPI_CONFIG(TFT_CS, on_color_trans_done, NULL);
+    // Depth 1 caps in-flight transfers; combined with the
+    // on_color_trans_done callback + semaphore below, display_draw_rect
+    // becomes fully synchronous — the caller's buffer is safe to reuse
+    // the moment the call returns.
     io_cfg.trans_queue_depth = 1;
     err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &lcd_io);
     if (err != ESP_OK) return err;
@@ -292,6 +306,12 @@ bool display_init(void)
     strip_buf = (uint16_t *)heap_caps_malloc(STRIP_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!strip_buf) {
         ESP_LOGE(TAG, "strip buffer alloc failed");
+        return false;
+    }
+
+    trans_done_sem = xSemaphoreCreateBinary();
+    if (!trans_done_sem) {
+        ESP_LOGE(TAG, "sem alloc failed");
         return false;
     }
 
@@ -343,6 +363,7 @@ void display_fill_rect(int x, int y, int w, int h, uint16_t rgb565)
     while (remaining > 0) {
         int chunk = remaining < rows ? remaining : rows;
         esp_lcd_panel_draw_bitmap(lcd_panel, x, y_cur, x + w, y_cur + chunk, strip_buf);
+        xSemaphoreTake(trans_done_sem, portMAX_DELAY);  // sync to keep strip_buf reusable
         y_cur += chunk;
         remaining -= chunk;
     }
@@ -353,4 +374,7 @@ void display_draw_rect(int x, int y, int w, int h, const uint16_t *pixels)
     if (!lcd_panel || !pixels) return;
     if (w <= 0 || h <= 0) return;
     esp_lcd_panel_draw_bitmap(lcd_panel, x, y, x + w, y + h, pixels);
+    // Block until the panel ISR reports the DMA is fully done — only
+    // then is it safe for the caller to refill or free `pixels`.
+    xSemaphoreTake(trans_done_sem, portMAX_DELAY);
 }
